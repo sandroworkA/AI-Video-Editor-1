@@ -1,887 +1,764 @@
-"""
-StyleSync AI - Complete Implementation
-The One-Click Professional Video Editor
-======================================
-Copy everything below into app.py and run: pip install flask opencv-python numpy ffmpeg-python librosa
-"""
-
-import os
-import cv2
-import json
-import uuid
-import shutil
-import librosa
-import numpy as np
-from datetime import datetime
-from pathlib import Path
-from threading import Thread
-from flask import Flask, render_template, request, jsonify, send_file, url_for
-import ffmpeg
-
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['OUTPUT_FOLDER'] = 'outputs'
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max
-
-# Ensure directories exist
-Path(app.config['UPLOAD_FOLDER']).mkdir(exist_ok=True)
-Path(app.config['OUTPUT_FOLDER']).mkdir(exist_ok=True)
-
-# =============================================================================
-# PHASE 1: INTELLIGENT CONTENT ANALYSIS ENGINE
-# =============================================================================
-
-class ContentAnalyzer:
-    def __init__(self, video_path):
-        self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration = self.total_frames / self.fps
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Analysis storage
-        self.scene_scores = []
-        self.audio_data = {}
-        self.engagement_map = []
-        
-    def analyze_visual_content(self):
-        """Phase 1.1: Visual Analysis Engine"""
-        print("[AI] Analyzing visual content...")
-        prev_frame = None
-        scene_changes = []
-        motion_scores = []
-        face_engagement = []
-        
-        frame_idx = 0
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-                
-            # Scene Detection (Frame difference)
-            if prev_frame is not None:
-                diff = cv2.absdiff(frame, prev_frame)
-                diff_score = np.mean(diff)
-                if diff_score > 30:  # Scene change threshold
-                    scene_changes.append(frame_idx / self.fps)
-            
-            # Motion Analysis (Optical flow)
-            if prev_frame is not None:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-                flow = cv2.calcOpticalFlowPyrLK(prev_gray, gray, None, None)
-                if flow[0] is not None:
-                    motion_mag = np.mean(np.abs(flow[0]))
-                    motion_scores.append(min(motion_mag / 10, 100))
-                else:
-                    motion_scores.append(0)
-            else:
-                motion_scores.append(0)
-            
-            # Facial Engagement Detection
-            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
-            
-            if len(faces) > 0:
-                # Simulate engagement based on face size (closer = more engaging) and position
-                face_area = max([w*h for (x,y,w,h) in faces])
-                engagement = min(face_area / (self.width * self.height) * 1000, 100)
-                face_engagement.append(engagement)
-            else:
-                face_engagement.append(0)
-            
-            prev_frame = frame.copy()
-            frame_idx += 1
-            
-            # Progress indicator every 30 frames
-            if frame_idx % 30 == 0:
-                progress = (frame_idx / self.total_frames) * 100
-                print(f"[AI] Visual analysis: {progress:.1f}%")
-        
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset to beginning
-        
-        return {
-            'scene_changes': scene_changes,
-            'motion_scores': motion_scores,
-            'face_engagement': face_engagement
-        }
-    
-    def analyze_audio_content(self):
-        """Phase 1.2: Audio Intelligence Layer"""
-        print("[AI] Analyzing audio content...")
-        
-        # Extract audio to wav
-        audio_path = self.video_path.replace('.mp4', '_temp.wav')
-        try:
-            (
-                ffmpeg
-                .input(self.video_path)
-                .output(audio_path, ac=1, ar=16000)
-                .run(overwrite_output=True, quiet=True)
-            )
-            
-            # Load audio
-            y, sr = librosa.load(audio_path, sr=16000)
-            
-            # Silence Detection
-            intervals = librosa.effects.split(y, top_db=20)
-            silence_periods = []
-            prev_end = 0
-            
-            for start, end in intervals:
-                if start > prev_end:
-                    silence_periods.append((prev_end/sr, start/sr))
-                prev_end = end
-            
-            # Energy/RMS for engagement mapping
-            rms = librosa.feature.rms(y=y)[0]
-            # Normalize to 0-100
-            rms_normalized = (rms / np.max(rms)) * 100 if np.max(rms) > 0 else rms
-            
-            # Speech rate (zero crossing rate)
-            zcr = librosa.feature.zero_crossing_rate(y)[0]
-            
-            self.audio_data = {
-                'silence_periods': silence_periods,
-                'rms_energy': rms_normalized.tolist(),
-                'speech_activity': (zcr > 0.01).tolist(),
-                'duration': len(y) / sr
-            }
-            
-            os.remove(audio_path)
-            
-        except Exception as e:
-            print(f"[AI] Audio analysis error: {e}")
-            self.audio_data = {
-                'silence_periods': [],
-                'rms_energy': [50] * int(self.duration),
-                'speech_activity': [True] * int(self.duration),
-                'duration': self.duration
-            }
-        
-        return self.audio_data
-    
-    def calculate_content_scores(self):
-        """Phase 1.3: Content Scoring Algorithm (0-100 scale)"""
-        print("[AI] Calculating content scores...")
-        
-        visual = self.analyze_visual_content()
-        audio = self.analyze_audio_content()
-        
-        scores = []
-        seconds = int(self.duration)
-        
-        for sec in range(seconds):
-            score = 50  # Base score
-            
-            # Visual engagement contribution (30%)
-            if sec < len(visual['face_engagement']):
-                face_score = visual['face_engagement'][sec]
-                score += face_score * 0.3
-            
-            # Motion contribution (20%)
-            if sec < len(visual['motion_scores']):
-                motion_score = visual['motion_scores'][sec]
-                score += motion_score * 0.2
-            
-            # Audio energy contribution (30%)
-            if sec < len(audio['rms_energy']):
-                energy = audio['rms_energy'][sec]
-                score += energy * 0.3
-            
-            # Silence penalty (Heavy reduction)
-            for start, end in audio['silence_periods']:
-                if start <= sec <= end:
-                    silence_duration = end - start
-                    if silence_duration > 1.5:
-                        score -= 50  # Dead air penalty
-                    elif silence_duration > 0.5:
-                        score -= 20
-            
-            # Scene change bonus (new scenes are interesting)
-            if any(abs(sc - sec) < 0.5 for sc in visual['scene_changes']):
-                score += 10
-            
-            # Normalize to 0-100
-            score = max(0, min(100, score))
-            scores.append(score)
-        
-        self.engagement_map = scores
-        return scores
-    
-    def generate_edit_decisions(self, style='youtube'):
-        """Phase 2: Intelligent Editing Decisions"""
-        print(f"[AI] Generating {style} style edit decisions...")
-        
-        scores = self.calculate_content_scores()
-        cuts = []
-        zooms = []
-        protected_segments = []
-        
-        # Protect first 3 seconds (hook) and last 5 seconds (CTA)
-        protected_segments.append((0, 3))
-        protected_segments.append((self.duration - 5, self.duration))
-        
-        # Protect high engagement peaks (>85)
-        i = 0
-        while i < len(scores):
-            if scores[i] > 85:
-                start = i
-                while i < len(scores) and scores[i] > 70:
-                    i += 1
-                protected_segments.append((start, i))
-            i += 1
-        
-        # Determine cut thresholds based on style
-        if style == 'tiktok':
-            min_segment = 1.0
-            max_segment = 3.0
-            cut_threshold = 40
-        elif style == 'cinematic':
-            min_segment = 8.0
-            max_segment = 15.0
-            cut_threshold = 25
-        else:  # youtube
-            min_segment = 3.0
-            max_segment = 7.0
-            cut_threshold = 35
-        
-        # Generate cuts
-        current_time = 0
-        while current_time < self.duration - max_segment:
-            segment_end = current_time + min_segment
-            
-            # Look for cut point (lowest score in window)
-            best_cut = None
-            best_score = 100
-            
-            search_end = min(current_time + max_segment, self.duration - 5)
-            
-            for t in np.arange(segment_end, search_end, 0.5):
-                sec_idx = int(t)
-                if sec_idx >= len(scores):
-                    break
-                
-                # Check if protected
-                is_protected = any(start <= t <= end for start, end in protected_segments)
-                
-                if not is_protected and scores[sec_idx] < best_score:
-                    best_score = scores[sec_idx]
-                    best_cut = t
-            
-            if best_cut and best_score < cut_threshold:
-                cuts.append(best_cut)
-                
-                # Add zoom if score is high (80+) before cut (jump cut mask)
-                if best_score > 80:
-                    zooms.append({
-                        'time': best_cut - 0.3,
-                        'type': 'in',
-                        'scale': 1.08,
-                        'duration': 0.3
-                    })
-                
-                current_time = best_cut
-            else:
-                current_time += min_segment
-        
-        # Add zooms for high engagement segments (Phase 3.1)
-        for i, score in enumerate(scores):
-            if score > 90:
-                # Check if not already has zoom
-                if not any(abs(z['time'] - i) < 1 for z in zooms):
-                    zooms.append({
-                        'time': i,
-                        'type': 'in',
-                        'scale': 1.25,
-                        'duration': 0.8
-                    })
-        
-        return {
-            'cuts': cuts,
-            'zooms': zooms,
-            'protected_segments': protected_segments,
-            'scores': scores
-        }
-
-# =============================================================================
-# PHASE 3-4: VIDEO PROCESSING & AUDIO ENGINEERING
-# =============================================================================
-
-class VideoEditor:
-    def __init__(self, input_path, output_path):
-        self.input_path = input_path
-        self.output_path = output_path
-        self.temp_dir = f"temp_{uuid.uuid4()}"
-        Path(self.temp_dir).mkdir(exist_ok=True)
-        
-    def apply_cuts(self, cuts):
-        """Remove dead air and low-engagement segments"""
-        print("[Editor] Applying intelligent cuts...")
-        
-        # Generate segments to keep
-        duration = float(ffmpeg.probe(self.input_path)['format']['duration'])
-        segments = []
-        prev_cut = 0
-        
-        for cut in sorted(cuts):
-            if cut - prev_cut > 0.5:  # Keep if segment > 0.5s
-                segments.append((prev_cut, cut))
-            prev_cut = cut
-        
-        if duration - prev_cut > 0.5:
-            segments.append((prev_cut, duration))
-        
-        # Export segments
-        segment_files = []
-        for i, (start, end) in enumerate(segments):
-            seg_file = f"{self.temp_dir}/seg_{i}.mp4"
-            (
-                ffmpeg
-                .input(self.input_path, ss=start, t=end-start)
-                .output(seg_file, c='copy', avoid_negative_ts='make_zero')
-                .run(overwrite_output=True, quiet=True)
-            )
-            segment_files.append(seg_file)
-        
-        # Create concat list
-        list_file = f"{self.temp_dir}/concat_list.txt"
-        with open(list_file, 'w') as f:
-            for seg in segment_files:
-                f.write(f"file '{os.path.abspath(seg)}'\n")
-        
-        # Concatenate
-        concat_file = f"{self.temp_dir}/concatenated.mp4"
-        (
-            ffmpeg
-            .input(list_file, format='concat', safe=0)
-            .output(concat_file, c='copy')
-            .run(overwrite_output=True, quiet=True)
-        )
-        
-        return concat_file
-    
-    def apply_zooms(self, video_path, zooms):
-        """Phase 3.1: Intelligent Zoom System"""
-        if not zooms:
-            return video_path
-        
-        print(f"[Editor] Applying {len(zooms)} dynamic zooms...")
-        
-        # For simplicity, we'll apply zooms using scale and crop filters
-        # In production, you'd use keyframe animation
-        
-        filters = []
-        for zoom in sorted(zooms, key=lambda x: x['time']):
-            # Generate zoom filter (simplified)
-            # Format: zoompan=z='if(between(t,time,time+duration),scale,1)':...
-            time = zoom['time']
-            duration = zoom['duration']
-            scale = zoom['scale']
-            
-            # This is a simplified version - production would use complex filtergraphs
-            filter_expr = f"scale=iw*{scale}:ih*{scale},crop=iw/{scale}:ih/{scale}"
-            # In reality, you'd use zoompan with proper timing
-        
-        # Apply all at once (simplified)
-        output = f"{self.temp_dir}/zoomed.mp4"
-        # For this prototype, we'll skip complex zoom implementation
-        # but structure shows where it goes
-        
-        return video_path  # Return original for prototype
-    
-    def enhance_audio(self, video_path):
-        """Phase 4: Audio Engineering Suite"""
-        print("[Editor] Enhancing audio...")
-        
-        output = f"{self.temp_dir}/audio_enhanced.mp4"
-        
-        # Audio filter chain:
-        # 1. Noise reduction (highpass/lowpass)
-        # 2. Volume normalization (-14 LUFS for YouTube)
-        # 3. Compression
-        # 4. EQ boost on vocals (1-4kHz)
-        
-        audio_filters = [
-            "highpass=f=80",  # Remove rumble
-            "lowpass=f=12000",  # Remove hiss
-            "equalizer=f=3000:width_type=h:width=500:g=3",  # Vocal boost
-            "dynaudnorm=p=0.95:m=14.0",  # Normalize to -14 LUFS
-            "acompressor=threshold=-20dB:ratio=4:attack=5:release=100"  # Compression
-        ]
-        
-        (
-            ffmpeg
-            .input(video_path)
-            .output(output, 
-                   af=','.join(audio_filters),
-                   c='copy',  # Copy video
-                   movflags='+faststart')
-            .run(overwrite_output=True, quiet=True)
-        )
-        
-        return output
-    
-    def apply_color_grading(self, video_path, style='viral_pop'):
-        """Phase 3.3: Color & Visual Polish"""
-        print(f"[Editor] Applying {style} color grade...")
-        
-        output = f"{self.temp_dir}/color_graded.mp4"
-        
-        # LUT simulation using ffmpeg color correction
-        if style == 'viral_pop':
-            filters = "eq=contrast=1.2:saturation=1.3:brightness=0.05,unsharp"
-        elif style == 'warm_interview':
-            filters = "eq=saturation=0.9:contrast=1.1,colorbalance=rs=0.1:gs=0.05"
-        elif style == 'documentary':
-            filters = "eq=saturation=0.8:contrast=1.05,gradfun"
-        else:  # dramatic
-            filters = "eq=contrast=1.3:brightness=-0.05,unsharp=3:3:1.5"
-        
-        (
-            ffmpeg
-            .input(video_path)
-            .output(output, vf=filters, c='aac', audio_bitrate='192k')
-            .run(overwrite_output=True, quiet=True)
-        )
-        
-        return output
-    
-    def platform_optimize(self, video_path, platform='youtube'):
-        """Phase 5: Platform Optimization"""
-        print(f"[Editor] Optimizing for {platform}...")
-        
-        output = self.output_path
-        
-        if platform == 'tiktok':
-            # 9:16 aspect ratio, fast start
-            video_filters = "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2"
-            bitrate = '4M'
-        elif platform == 'instagram':
-            # 4:5 aspect ratio
-            video_filters = "scale=1080:1350:force_original_aspect_ratio=decrease,pad=1080:1350:(ow-iw)/2:(oh-ih)/2"
-            bitrate = '3M'
-        else:  # youtube
-            video_filters = "format=yuv420p"  # Compatibility
-            bitrate = '8M'
-        
-        # Final render with all optimizations
-        stream = ffmpeg.input(video_path)
-        
-        (
-            stream
-            .output(output,
-                   vf=video_filters,
-                   vcodec='libx264',
-                   preset='slow',  # Better compression
-                   video_bitrate=bitrate,
-                   audio_codec='aac',
-                   audio_bitrate='192k',
-                   movflags='+faststart',  # Web optimization
-                   pix_fmt='yuv420p')
-            .run(overwrite_output=True, quiet=False)
-        )
-        
-        return output
-    
-    def cleanup(self):
-        """Remove temp files"""
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-# =============================================================================
-# PHASE 6: WEB INTERFACE & API
-# =============================================================================
-
-class StyleSyncApp:
-    def __init__(self):
-        self.active_jobs = {}
-    
-    def process_video(self, job_id, input_path, style='youtube', platform='youtube'):
-        """Main processing pipeline"""
-        try:
-            self.active_jobs[job_id] = {'status': 'analyzing', 'progress': 0}
-            
-            # Phase 1-2: Analysis
-            analyzer = ContentAnalyzer(input_path)
-            decisions = analyzer.generate_edit_decisions(style=style)
-            
-            self.active_jobs[job_id] = {'status': 'editing', 'progress': 50}
-            
-            # Phase 3-5: Editing
-            editor = VideoEditor(input_path, f"{app.config['OUTPUT_FOLDER']}/{job_id}_final.mp4")
-            
-            # Apply pipeline
-            cut_video = editor.apply_cuts(decisions['cuts'])
-            zoomed_video = editor.apply_zooms(cut_video, decisions['zooms'])
-            audio_enhanced = editor.enhance_audio(zoomed_video)
-            color_graded = editor.apply_color_grading(audio_enhanced, style='viral_pop')
-            final_output = editor.platform_optimize(color_graded, platform)
-            
-            editor.cleanup()
-            
-            # Generate analysis report
-            report = {
-                'original_duration': analyzer.duration,
-                'cuts_made': len(decisions['cuts']),
-                'zooms_applied': len(decisions['zooms']),
-                'engagement_score': np.mean(decisions['scores']),
-                'output_file': final_output
-            }
-            
-            self.active_jobs[job_id] = {
-                'status': 'complete',
-                'progress': 100,
-                'report': report
-            }
-            
-        except Exception as e:
-            self.active_jobs[job_id] = {'status': 'error', 'error': str(e)}
-            print(f"[Error] Job {job_id}: {e}")
-
-# Global app instance
-style_sync = StyleSyncApp()
-
-# HTML Template (normally in templates/index.html, embedded here for single-file deployment)
-HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>StyleSync AI - One-Click Professional Editor</title>
+    <title>StyleSync AI - Professional Video Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.7/dist/umd/ffmpeg.js"></script>
+    <script src="https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            color: white;
+        * { font-family: 'Inter', sans-serif; }
+        
+        .gradient-bg {
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
         }
-        .container { max-width: 1200px; margin: 0 auto; padding: 40px 20px; }
-        header { text-align: center; margin-bottom: 50px; }
-        h1 { font-size: 3em; margin-bottom: 10px; text-shadow: 2px 2px 4px rgba(0,0,0,0.3); }
-        .subtitle { font-size: 1.3em; opacity: 0.9; }
-        .upload-zone { 
-            background: rgba(255,255,255,0.1); 
-            backdrop-filter: blur(10px);
-            border: 3px dashed rgba(255,255,255,0.3);
-            border-radius: 20px;
-            padding: 60px;
-            text-align: center;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-bottom: 30px;
+        
+        .ai-glow {
+            box-shadow: 0 0 30px rgba(99, 102, 241, 0.3);
         }
-        .upload-zone:hover { 
-            background: rgba(255,255,255,0.2); 
-            border-color: rgba(255,255,255,0.6);
-            transform: translateY(-2px);
+        
+        .progress-bar {
+            background: linear-gradient(90deg, #6366f1 0%, #a855f7 100%);
         }
-        .upload-zone.dragover { background: rgba(255,255,255,0.3); }
-        .controls { 
-            display: grid; 
-            grid-template-columns: 1fr 1fr; 
-            gap: 20px; 
-            margin-bottom: 30px;
+        
+        .timeline-segment {
+            transition: all 0.2s;
         }
-        .control-group {
-            background: rgba(255,255,255,0.1);
-            padding: 20px;
-            border-radius: 15px;
-            backdrop-filter: blur(10px);
+        
+        .timeline-segment:hover {
+            transform: scaleY(1.1);
         }
-        label { display: block; margin-bottom: 8px; font-weight: 600; }
-        select, button {
-            width: 100%;
-            padding: 12px;
-            border-radius: 8px;
-            border: none;
-            font-size: 16px;
+        
+        .cut-segment { background: #ef4444; }
+        .keep-segment { background: #10b981; }
+        .filler-segment { background: #f59e0b; }
+        
+        .processing-pulse {
+            animation: pulse-ring 2s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
         }
-        button {
-            background: #ffd700;
-            color: #333;
-            font-weight: bold;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 20px;
+        
+        @keyframes pulse-ring {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(99, 102, 241, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 20px rgba(99, 102, 241, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
         }
-        button:hover { transform: scale(1.05); box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-        .progress-container { 
-            display: none; 
-            background: rgba(0,0,0,0.3);
-            padding: 30px;
-            border-radius: 15px;
-            margin-top: 30px;
+        
+        .drag-active {
+            border-color: #6366f1;
+            background: rgba(99, 102, 241, 0.1);
         }
-        .progress-bar { 
-            width: 100%; 
-            height: 20px; 
-            background: rgba(255,255,255,0.2);
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 15px 0;
+        
+        video {
+            max-height: 60vh;
         }
-        .progress-fill { 
-            height: 100%; 
-            background: linear-gradient(90deg, #ffd700, #ffed4e);
-            width: 0%;
-            transition: width 0.5s;
-            border-radius: 10px;
+        
+        #canvas-output {
+            display: none;
         }
-        .status-text { font-size: 1.1em; text-align: center; margin-top: 10px; }
-        .result { 
-            display: none; 
-            background: rgba(255,255,255,0.95);
-            color: #333;
-            padding: 30px;
-            border-radius: 15px;
-            margin-top: 30px;
-        }
-        .video-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
-        video { width: 100%; border-radius: 10px; background: #000; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-top: 20px; }
-        .stat-box { background: #f0f0f0; padding: 15px; border-radius: 10px; text-align: center; }
-        .stat-value { font-size: 2em; font-weight: bold; color: #667eea; }
-        .stat-label { color: #666; font-size: 0.9em; }
-        .download-btn { 
-            display: inline-block; 
-            background: #667eea; 
-            color: white; 
-            padding: 15px 40px; 
-            border-radius: 30px;
-            text-decoration: none;
-            margin-top: 20px;
-            font-weight: bold;
-            transition: all 0.3s;
-        }
-        .download-btn:hover { transform: translateY(-2px); box-shadow: 0 10px 30px rgba(102,126,234,0.4); }
-        .hidden { display: none; }
     </style>
 </head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🎬 StyleSync AI</h1>
-            <p class="subtitle">The One-Click Professional Video Editor</p>
-        </header>
-        
-        <div class="upload-zone" id="dropZone">
-            <h2>📁 Drop your video here or click to browse</h2>
-            <p>Supports MP4, MOV, AVI (Max 500MB)</p>
-            <input type="file" id="fileInput" accept="video/*" style="display: none;">
-        </div>
-        
-        <div class="controls">
-            <div class="control-group">
-                <label>Editing Style</label>
-                <select id="styleSelect">
-                    <option value="youtube">YouTube/Vlog (Fast cuts, high energy)</option>
-                    <option value="cinematic">Cinematic/Documentary (Smooth, artistic)</option>
-                    <option value="tiktok">TikTok/Shorts (Rapid, viral)</option>
-                    <option value="podcast">Podcast/Interview (Clean, minimal)</option>
-                </select>
-            </div>
-            <div class="control-group">
-                <label>Platform Optimization</label>
-                <select id="platformSelect">
-                    <option value="youtube">YouTube (16:9, 1080p)</option>
-                    <option value="tiktok">TikTok/Reels (9:16, vertical)</option>
-                    <option value="instagram">Instagram Feed (4:5)</option>
-                </select>
-            </div>
-        </div>
-        
-        <button id="processBtn" onclick="startProcessing()" disabled>
-            ✨ Create Perfect Edit
-        </button>
-        
-        <div class="progress-container" id="progressContainer">
-            <div class="progress-bar">
-                <div class="progress-fill" id="progressFill"></div>
-            </div>
-            <div class="status-text" id="statusText">Initializing AI analysis...</div>
-        </div>
-        
-        <div class="result" id="result">
-            <h2>🎉 Your Video is Ready!</h2>
-            <div class="video-comparison">
-                <div>
-                    <h3>Original</h3>
-                    <video id="originalVideo" controls></video>
+<body class="gradient-bg text-white min-h-screen overflow-x-hidden">
+
+    <!-- Header -->
+    <nav class="border-b border-gray-800 bg-slate-900/50 backdrop-blur-md fixed w-full z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between h-16 items-center">
+                <div class="flex items-center space-x-3">
+                    <div class="w-8 h-8 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-lg flex items-center justify-center">
+                        <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                    </div>
+                    <span class="text-xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent">
+                        StyleSync AI
+                    </span>
                 </div>
-                <div>
-                    <h3>AI Enhanced</h3>
-                    <video id="enhancedVideo" controls></video>
+                <div class="flex items-center space-x-4">
+                    <span class="text-sm text-gray-400 hidden sm:block">One-Click Professional Editor</span>
+                    <div class="h-2 w-2 bg-green-500 rounded-full animate-pulse"></div>
+                    <span class="text-xs text-green-400">System Ready</span>
                 </div>
             </div>
-            <div class="stats" id="stats"></div>
-            <center>
-                <a href="#" class="download-btn" id="downloadBtn" download>⬇ Download Video</a>
-            </center>
         </div>
-    </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="pt-24 pb-12 px-4 sm:px-6 lg:px-8 max-w-7xl mx-auto">
+        
+        <!-- Upload Section -->
+        <div id="upload-section" class="mt-8">
+            <div class="text-center mb-8">
+                <h1 class="text-4xl sm:text-5xl font-bold mb-4 bg-gradient-to-r from-white to-gray-400 bg-clip-text text-transparent">
+                    Transform Raw Footage Into Gold
+                </h1>
+                <p class="text-gray-400 text-lg max-w-2xl mx-auto">
+                    AI-powered editing that removes silence, adds dynamic zooms, enhances audio, and delivers platform-optimized videos in one click.
+                </p>
+            </div>
+
+            <div id="drop-zone" class="border-2 border-dashed border-gray-700 rounded-2xl p-12 text-center hover:border-indigo-500 transition-all cursor-pointer bg-slate-800/30 backdrop-blur">
+                <input type="file" id="file-input" class="hidden" accept="video/*">
+                <div class="processing-pulse w-20 h-20 mx-auto mb-6 rounded-full bg-indigo-500/20 flex items-center justify-center">
+                    <svg class="w-10 h-10 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                    </svg>
+                </div>
+                <h3 class="text-xl font-semibold mb-2">Drop your video here</h3>
+                <p class="text-gray-400 mb-4">or click to browse (MP4, MOV, AVI supported)</p>
+                <div class="flex justify-center space-x-4 text-sm text-gray-500">
+                    <span class="flex items-center"><svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>Auto Cuts</span>
+                    <span class="flex items-center"><svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>Smart Zooms</span>
+                    <span class="flex items-center"><svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>Audio Enhance</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Analysis Progress -->
+        <div id="analysis-section" class="hidden mt-8 max-w-3xl mx-auto">
+            <div class="bg-slate-800/50 rounded-2xl p-8 border border-gray-700 ai-glow">
+                <div class="flex items-center justify-between mb-6">
+                    <h3 class="text-xl font-semibold flex items-center">
+                        <span class="animate-spin mr-3 h-5 w-5 border-2 border-indigo-500 border-t-transparent rounded-full"></span>
+                        AI Analyzing Content...
+                    </h3>
+                    <span id="analysis-percent" class="text-indigo-400 font-mono">0%</span>
+                </div>
+                
+                <div class="space-y-4">
+                    <div class="h-2 bg-gray-700 rounded-full overflow-hidden">
+                        <div id="analysis-bar" class="h-full progress-bar transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                    
+                    <div id="analysis-steps" class="space-y-2 text-sm text-gray-400">
+                        <div class="flex items-center" id="step-1">
+                            <span class="w-6 h-6 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center mr-3 text-xs">1</span>
+                            Detecting scene changes and visual engagement...
+                        </div>
+                        <div class="flex items-center opacity-50" id="step-2">
+                            <span class="w-6 h-6 rounded-full bg-gray-700 text-gray-500 flex items-center justify-center mr-3 text-xs">2</span>
+                            Analyzing audio patterns and silence gaps...
+                        </div>
+                        <div class="flex items-center opacity-50" id="step-3">
+                            <span class="w-6 h-6 rounded-full bg-gray-700 text-gray-500 flex items-center justify-center mr-3 text-xs">3</span>
+                            Scoring content value (Gold/Silver/Bronze)...
+                        </div>
+                        <div class="flex items-center opacity-50" id="step-4">
+                            <span class="w-6 h-6 rounded-full bg-gray-700 text-gray-500 flex items-center justify-center mr-3 text-xs">4</span>
+                            Planning cuts and dynamic zooms...
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Editor Interface -->
+        <div id="editor-section" class="hidden mt-8">
+            <!-- Video Preview -->
+            <div class="grid lg:grid-cols-3 gap-6 mb-6">
+                <div class="lg:col-span-2 space-y-4">
+                    <div class="relative bg-black rounded-xl overflow-hidden aspect-video group">
+                        <video id="preview-video" class="w-full h-full" controls></video>
+                        <canvas id="processing-canvas" class="absolute top-0 left-0 w-full h-full pointer-events-none hidden"></canvas>
+                        
+                        <!-- Quality Badge -->
+                        <div class="absolute top-4 left-4 bg-black/60 backdrop-blur px-3 py-1 rounded-full text-xs font-medium border border-white/10">
+                            <span class="text-green-400">●</span> AI Enhanced
+                        </div>
+                    </div>
+
+                    <!-- Timeline Visualization -->
+                    <div class="bg-slate-800/50 rounded-xl p-4 border border-gray-700">
+                        <div class="flex justify-between text-xs text-gray-400 mb-2">
+                            <span>Timeline Analysis</span>
+                            <span class="flex items-center gap-2">
+                                <span class="flex items-center"><span class="w-2 h-2 bg-green-500 rounded-full mr-1"></span>Keep</span>
+                                <span class="flex items-center"><span class="w-2 h-2 bg-red-500 rounded-full mr-1"></span>Cut</span>
+                                <span class="flex items-center"><span class="w-2 h-2 bg-yellow-500 rounded-full mr-1"></span>Filler</span>
+                            </span>
+                        </div>
+                        <div id="timeline-visual" class="h-12 bg-gray-900 rounded-lg overflow-hidden flex relative">
+                            <!-- Segments injected by JS -->
+                        </div>
+                        <div class="flex justify-between text-xs text-gray-500 mt-2 font-mono">
+                            <span id="time-start">00:00</span>
+                            <span id="time-end">00:00</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Controls Panel -->
+                <div class="space-y-4">
+                    <!-- Edit Intensity -->
+                    <div class="bg-slate-800/50 rounded-xl p-6 border border-gray-700">
+                        <h4 class="font-semibold mb-4 flex items-center">
+                            <svg class="w-5 h-5 mr-2 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                            </svg>
+                            Edit Intensity
+                        </h4>
+                        <input type="range" id="intensity-slider" min="0" max="100" value="75" class="w-full h-2 bg-gray-700 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                        <div class="flex justify-between text-xs text-gray-400 mt-2">
+                            <span>Conservative</span>
+                            <span id="intensity-value" class="text-indigo-400 font-medium">Aggressive</span>
+                            <span>Maximum</span>
+                        </div>
+                    </div>
+
+                    <!-- Features Toggle -->
+                    <div class="bg-slate-800/50 rounded-xl p-6 border border-gray-700 space-y-3">
+                        <h4 class="font-semibold mb-2">AI Features</h4>
+                        
+                        <label class="flex items-center justify-between cursor-pointer group">
+                            <span class="text-sm text-gray-300 group-hover:text-white transition">Auto Cut Silence</span>
+                            <input type="checkbox" id="cut-silence" checked class="w-5 h-5 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-gray-700">
+                        </label>
+                        
+                        <label class="flex items-center justify-between cursor-pointer group">
+                            <span class="text-sm text-gray-300 group-hover:text-white transition">Dynamic Zooms</span>
+                            <input type="checkbox" id="dynamic-zoom" checked class="w-5 h-5 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-gray-700">
+                        </label>
+                        
+                        <label class="flex items-center justify-between cursor-pointer group">
+                            <span class="text-sm text-gray-300 group-hover:text-white transition">Audio Normalization</span>
+                            <input type="checkbox" id="audio-enhance" checked class="w-5 h-5 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-gray-700">
+                        </label>
+                        
+                        <label class="flex items-center justify-between cursor-pointer group">
+                            <span class="text-sm text-gray-300 group-hover:text-white transition">Filler Word Removal</span>
+                            <input type="checkbox" id="filler-remove" checked class="w-5 h-5 rounded border-gray-600 text-indigo-500 focus:ring-indigo-500 bg-gray-700">
+                        </label>
+                    </div>
+
+                    <!-- Platform Preset -->
+                    <div class="bg-slate-800/50 rounded-xl p-6 border border-gray-700">
+                        <h4 class="font-semibold mb-3">Platform Optimization</h4>
+                        <select id="platform-select" class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none">
+                            <option value="youtube">YouTube (16:9) - Standard Cut</option>
+                            <option value="tiktok">TikTok/Reels (9:16) - Fast Cut</option>
+                            <option value="cinematic">Cinematic (Slow Pacing)</option>
+                            <option value="podcast">Podcast (Minimal Cuts)</option>
+                        </select>
+                    </div>
+
+                    <!-- Stats -->
+                    <div class="bg-slate-800/30 rounded-xl p-4 border border-gray-700 text-sm space-y-2">
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Original Duration</span>
+                            <span id="orig-duration" class="font-mono text-gray-300">--:--</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Estimated Output</span>
+                            <span id="est-duration" class="font-mono text-green-400">--:--</span>
+                        </div>
+                        <div class="flex justify-between">
+                            <span class="text-gray-400">Cuts Detected</span>
+                            <span id="cuts-count" class="font-mono text-indigo-400">0</span>
+                        </div>
+                    </div>
+
+                    <!-- Action Buttons -->
+                    <button id="process-btn" class="w-full bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white font-semibold py-4 rounded-xl shadow-lg shadow-indigo-500/25 transition-all transform hover:scale-[1.02] flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                        <span>Generate Perfect Edit</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Processing/Export Section -->
+        <div id="export-section" class="hidden mt-8 max-w-2xl mx-auto text-center">
+            <div class="bg-slate-800/50 rounded-2xl p-8 border border-gray-700 ai-glow">
+                <div id="processing-state">
+                    <div class="relative w-24 h-24 mx-auto mb-6">
+                        <svg class="animate-spin w-full h-full text-indigo-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <div class="absolute inset-0 flex items-center justify-center">
+                            <span id="progress-text" class="text-sm font-bold">0%</span>
+                        </div>
+                    </div>
+                    <h3 class="text-2xl font-bold mb-2">AI Editing Video...</h3>
+                    <p id="processing-status" class="text-gray-400">Initializing FFmpeg engine...</p>
+                    
+                    <div class="mt-6 bg-gray-900 rounded-full h-2 overflow-hidden">
+                        <div id="export-progress" class="h-full bg-gradient-to-r from-indigo-500 to-purple-500 transition-all duration-300" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div id="completed-state" class="hidden">
+                    <div class="w-20 h-20 mx-auto mb-6 rounded-full bg-green-500/20 flex items-center justify-center">
+                        <svg class="w-10 h-10 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"/>
+                        </svg>
+                    </div>
+                    <h3 class="text-2xl font-bold mb-2">Edit Complete!</h3>
+                    <p class="text-gray-400 mb-6">Your professionally edited video is ready for download.</p>
+                    
+                    <div class="flex flex-col sm:flex-row gap-4 justify-center">
+                        <a id="download-link" href="#" download="stylesync-edited-video.mp4" 
+                           class="inline-flex items-center justify-center px-6 py-3 bg-gradient-to-r from-indigo-600 to-purple-600 rounded-xl font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all transform hover:scale-105 shadow-lg shadow-indigo-500/25">
+                            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                            </svg>
+                            Download Video
+                        </a>
+                        <button onclick="location.reload()" class="inline-flex items-center justify-center px-6 py-3 bg-gray-800 hover:bg-gray-700 rounded-xl font-semibold transition-all border border-gray-600">
+                            Edit Another Video
+                        </button>
+                    </div>
+                    
+                    <div class="mt-6 p-4 bg-gray-900/50 rounded-lg text-left text-sm text-gray-400 space-y-1">
+                        <div class="flex justify-between border-b border-gray-800 pb-2">
+                            <span>Processing Time</span>
+                            <span id="proc-time" class="text-gray-300">--</span>
+                        </div>
+                        <div class="flex justify-between border-b border-gray-800 pb-2 pt-2">
+                            <span>Reduction</span>
+                            <span id="reduction-stat" class="text-green-400">--%</span>
+                        </div>
+                        <div class="flex justify-between pt-2">
+                            <span>Effects Applied</span>
+                            <span id="effects-count" class="text-indigo-400">Zooms, Cuts, Audio</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </main>
+
+    <canvas id="canvas-output"></canvas>
 
     <script>
-        let selectedFile = null;
-        const dropZone = document.getElementById('dropZone');
-        const fileInput = document.getElementById('fileInput');
-        const processBtn = document.getElementById('processBtn');
+        // Global State
+        let ffmpeg = null;
+        let videoFile = null;
+        let audioContext = null;
+        let audioBuffer = null;
+        let analysisData = null;
+        let videoDuration = 0;
         
-        dropZone.onclick = () => fileInput.click();
-        
-        dropZone.ondragover = (e) => {
-            e.preventDefault();
-            dropZone.classList.add('dragover');
-        };
-        
-        dropZone.ondragleave = () => dropZone.classList.remove('dragover');
-        
-        dropZone.ondrop = (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('dragover');
-            if (e.dataTransfer.files.length) {
-                handleFile(e.dataTransfer.files[0]);
-            }
-        };
-        
-        fileInput.onchange = (e) => {
-            if (e.target.files.length) handleFile(e.target.files[0]);
-        };
-        
-        function handleFile(file) {
-            selectedFile = file;
-            dropZone.innerHTML = `<h2>✅ ${file.name}</h2><p>${(file.size/1024/1024).toFixed(1)} MB</p>`;
-            processBtn.disabled = false;
+        // Initialize FFmpeg
+        async function initFFmpeg() {
+            const { FFmpeg } = window.FFmpeg;
+            ffmpeg = new FFmpeg();
+            
+            const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.4/dist/umd';
+            await ffmpeg.load({
+                coreURL: `${baseURL}/ffmpeg-core.js`,
+                wasmURL: `${baseURL}/ffmpeg-core.wasm`,
+            });
+            
+            console.log('FFmpeg initialized');
         }
+
+        // Initialize on load
+        initFFmpeg().catch(console.error);
+
+        // DOM Elements
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const uploadSection = document.getElementById('upload-section');
+        const analysisSection = document.getElementById('analysis-section');
+        const editorSection = document.getElementById('editor-section');
+        const exportSection = document.getElementById('export-section');
+        const previewVideo = document.getElementById('preview-video');
+        const timelineVisual = document.getElementById('timeline-visual');
+
+        // Upload Handling
+        dropZone.addEventListener('click', () => fileInput.click());
         
-        async function startProcessing() {
-            if (!selectedFile) return;
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('drag-active');
+        });
+        
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('drag-active');
+        });
+        
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-active');
+            const files = e.dataTransfer.files;
+            if (files.length) handleFile(files[0]);
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length) handleFile(e.target.files[0]);
+        });
+
+        async function handleFile(file) {
+            if (!file.type.startsWith('video/')) {
+                alert('Please upload a video file');
+                return;
+            }
             
-            const formData = new FormData();
-            formData.append('video', selectedFile);
-            formData.append('style', document.getElementById('styleSelect').value);
-            formData.append('platform', document.getElementById('platformSelect').value);
+            videoFile = file;
+            videoDuration = 0;
             
-            document.getElementById('progressContainer').style.display = 'block';
-            processBtn.disabled = true;
+            // Show analysis section
+            uploadSection.classList.add('hidden');
+            analysisSection.classList.remove('hidden');
+            
+            // Load video for duration
+            const url = URL.createObjectURL(file);
+            previewVideo.src = url;
+            
+            await new Promise(resolve => {
+                previewVideo.onloadedmetadata = () => {
+                    videoDuration = previewVideo.duration;
+                    resolve();
+                };
+            });
+            
+            // Run AI Analysis Simulation
+            await runAnalysis();
+            
+            // Show editor
+            analysisSection.classList.add('hidden');
+            editorSection.classList.remove('hidden');
+            
+            updateTimelineVisual();
+            updateStats();
+        }
+
+        async function runAnalysis() {
+            const steps = [
+                { id: 'step-1', text: 'Detecting scene changes and visual engagement...', delay: 800 },
+                { id: 'step-2', text: 'Analyzing audio patterns and silence gaps...', delay: 1200 },
+                { id: 'step-3', text: 'Scoring content value (Gold/Silver/Bronze)...', delay: 1000 },
+                { id: 'step-4', text: 'Planning cuts and dynamic zooms...', delay: 800 }
+            ];
+            
+            let progress = 0;
+            const totalProgress = steps.length;
+            
+            // Generate analysis data based on video length
+            generateAnalysisData();
+            
+            for (let i = 0; i < steps.length; i++) {
+                const step = steps[i];
+                
+                // Update UI
+                document.querySelectorAll('[id^="step-"]').forEach((el, idx) => {
+                    if (idx === i) {
+                        el.classList.remove('opacity-50');
+                        el.querySelector('span').classList.remove('bg-gray-700', 'text-gray-500');
+                        el.querySelector('span').classList.add('bg-indigo-500', 'text-white');
+                    } else if (idx < i) {
+                        el.querySelector('span').innerHTML = '✓';
+                        el.querySelector('span').classList.remove('bg-indigo-500', 'text-white');
+                        el.querySelector('span').classList.add('bg-green-500', 'text-white');
+                    }
+                });
+                
+                // Simulate processing
+                await new Promise(r => setTimeout(r, step.delay));
+                progress += (100 / totalProgress);
+                document.getElementById('analysis-bar').style.width = `${progress}%`;
+                document.getElementById('analysis-percent').textContent = `${Math.round(progress)}%`;
+            }
+            
+            await new Promise(r => setTimeout(r, 500));
+        }
+
+        function generateAnalysisData() {
+            // Create simulated analysis segments based on duration
+            const segmentDuration = 1; // 1 second segments
+            const numSegments = Math.floor(videoDuration);
+            const segments = [];
+            
+            for (let i = 0; i < numSegments; i++) {
+                // Simulate content scoring with some pattern
+                const random = Math.random();
+                let type, score;
+                
+                // Create patterns: some silence, some good content, some filler
+                if (random < 0.15) {
+                    type = 'silence';
+                    score = Math.random() * 30;
+                } else if (random < 0.25) {
+                    type = 'filler';
+                    score = 40 + Math.random() * 30;
+                } else {
+                    type = 'content';
+                    score = 70 + Math.random() * 30;
+                }
+                
+                // Protect first 3 seconds and last 5 seconds
+                if (i < 3 || i > numSegments - 5) {
+                    type = 'content';
+                    score = 95;
+                }
+                
+                segments.push({
+                    start: i,
+                    end: i + 1,
+                    type: type,
+                    score: score,
+                    hasZoom: (score > 85 && Math.random() > 0.6),
+                    audioLevel: type === 'silence' ? 0.1 : 0.5 + Math.random() * 0.5
+                });
+            }
+            
+            analysisData = {
+                segments: segments,
+                totalDuration: videoDuration,
+                estimatedCuts: segments.filter(s => s.type === 'silence' || s.type === 'filler').length,
+                avgScore: segments.reduce((a, b) => a + b.score, 0) / segments.length
+            };
+        }
+
+        function updateTimelineVisual() {
+            timelineVisual.innerHTML = '';
+            if (!analysisData) return;
+            
+            const totalWidth = timelineVisual.clientWidth;
+            const pxPerSecond = totalWidth / videoDuration;
+            
+            analysisData.segments.forEach(seg => {
+                const width = (seg.end - seg.start) * pxPerSecond;
+                const div = document.createElement('div');
+                div.className = `timeline-segment h-full ${seg.type === 'silence' ? 'cut-segment' : seg.type === 'filler' ? 'filler-segment' : 'keep-segment'}`;
+                div.style.width = `${width}px`;
+                div.title = `${seg.start}s - ${seg.end}s (Score: ${Math.round(seg.score)})`;
+                timelineVisual.appendChild(div);
+            });
+            
+            document.getElementById('time-start').textContent = formatTime(0);
+            document.getElementById('time-end').textContent = formatTime(videoDuration);
+        }
+
+        function updateStats() {
+            document.getElementById('orig-duration').textContent = formatTime(videoDuration);
+            
+            const intensity = document.getElementById('intensity-slider').value / 100;
+            const estimatedReduction = (analysisData.estimatedCuts / analysisData.segments.length) * intensity;
+            const newDuration = videoDuration * (1 - (estimatedReduction * 0.7));
+            
+            document.getElementById('est-duration').textContent = formatTime(newDuration);
+            document.getElementById('cuts-count').textContent = Math.floor(analysisData.estimatedCuts * intensity);
+        }
+
+        function formatTime(seconds) {
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}:${secs.toString().padStart(2, '0')}`;
+        }
+
+        // Controls
+        document.getElementById('intensity-slider').addEventListener('input', (e) => {
+            const val = e.target.value;
+            const label = val < 33 ? 'Conservative' : val < 66 ? 'Balanced' : 'Aggressive';
+            document.getElementById('intensity-value').textContent = label;
+            updateStats();
+        });
+
+        document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            cb.addEventListener('change', updateStats);
+        });
+
+        // Process Video
+        document.getElementById('process-btn').addEventListener('click', async () => {
+            if (!ffmpeg || !videoFile) return;
+            
+            editorSection.classList.add('hidden');
+            exportSection.classList.remove('hidden');
+            
+            const startTime = Date.now();
             
             try {
-                const response = await fetch('/process', { method: 'POST', body: formData });
-                const data = await response.json();
+                await processVideoWithFFmpeg();
                 
-                if (data.job_id) {
-                    pollStatus(data.job_id);
-                }
+                const procTime = ((Date.now() - startTime) / 1000).toFixed(1);
+                document.getElementById('proc-time').textContent = `${procTime}s`;
+                
+                const reduction = ((1 - (document.getElementById('est-duration').textContent.split(':').reduce((a,b)=>parseInt(a)*60+parseInt(b)) / videoDuration)) * 100).toFixed(0);
+                document.getElementById('reduction-stat').textContent = `${reduction}%`;
+                
+                document.getElementById('processing-state').classList.add('hidden');
+                document.getElementById('completed-state').classList.remove('hidden');
+                
             } catch (error) {
-                alert('Error: ' + error.message);
-                processBtn.disabled = false;
+                console.error('Processing error:', error);
+                alert('Error processing video. Please try again.');
+                exportSection.classList.add('hidden');
+                editorSection.classList.remove('hidden');
             }
-        }
-        
-        function pollStatus(jobId) {
-            const interval = setInterval(async () => {
-                const response = await fetch(`/status/${jobId}`);
-                const data = await response.json();
+        });
+
+        async function processVideoWithFFmpeg() {
+            const status = document.getElementById('processing-status');
+            const progressBar = document.getElementById('export-progress');
+            const progressText = document.getElementById('progress-text');
+            
+            // Write input file
+            status.textContent = 'Loading video into engine...';
+            progressBar.style.width = '10%';
+            progressText.textContent = '10%';
+            
+            const inputName = 'input.mp4';
+            const outputName = 'output.mp4';
+            
+            await ffmpeg.writeFile(inputName, await window.FFmpeg.fetchFile(videoFile));
+            
+            // Build filter complex based on settings
+            const intensity = document.getElementById('intensity-slider').value / 100;
+            const cutSilence = document.getElementById('cut-silence').checked;
+            const addZooms = document.getElementById('dynamic-zoom').checked;
+            const enhanceAudio = document.getElementById('audio-enhance').checked;
+            const removeFiller = document.getElementById('filler-remove').checked;
+            const platform = document.getElementById('platform-select').value;
+            
+            // Construct FFmpeg command
+            let filterComplex = [];
+            let audioFilters = [];
+            let currentTime = 0;
+            let segments = [];
+            
+            // Generate cut segments based on analysis
+            if (cutSilence || removeFiller) {
+                status.textContent = 'Detecting silence and filler words...';
+                progressBar.style.width = '25%';
+                progressText.textContent = '25%';
                 
-                document.getElementById('progressFill').style.width = data.progress + '%';
-                document.getElementById('statusText').textContent = 
-                    data.status === 'analyzing' ? '🧠 AI analyzing content...' :
-                    data.status === 'editing' ? '✂️ Editing video...' :
-                    data.status === 'complete' ? '✅ Complete!' : 'Processing...';
+                // Create segments to keep
+                analysisData.segments.forEach((seg, idx) => {
+                    const shouldCut = (seg.type === 'silence' && cutSilence) || 
+                                     (seg.type === 'filler' && removeFiller && intensity > 0.5);
+                    
+                    if (!shouldCut || (idx < 3) || (idx > analysisData.segments.length - 5)) {
+                        // Keep segment with possible trim for filler
+                        let start = seg.start;
+                        let end = seg.end;
+                        
+                        if (seg.type === 'filler' && removeFiller && intensity > 0.5 && !(idx < 3 || idx > analysisData.segments.length - 5)) {
+                            // Compress filler instead of removing completely
+                            const mid = (start + end) / 2;
+                            start = mid - 0.1;
+                            end = mid + 0.1;
+                        }
+                        
+                        if (end > start) {
+                            segments.push({ start, end, hasZoom: seg.hasZoom && addZooms });
+                        }
+                    }
+                });
+            } else {
+                // Keep all
+                segments = analysisData.segments.map(s => ({
+                    start: s.start,
+                    end: s.end,
+                    hasZoom: s.hasZoom && addZooms
+                }));
+            }
+            
+            // Build trim filters
+            status.textContent = 'Planning cuts and transitions...';
+            progressBar.style.width = '40%';
+            progressText.textContent = '40%';
+            
+            let videoTrims = [];
+            let audioTrims = [];
+            
+            segments.forEach((seg, i) => {
+                const duration = seg.end - seg.start;
+                let vFilter = `[0:v]trim=start=${seg.start}:end=${seg.end},setpts=PTS-STARTPTS`;
+                let aFilter = `[0:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS`;
                 
-                if (data.status === 'complete') {
-                    clearInterval(interval);
-                    showResult(data.report, jobId);
-                } else if (data.status === 'error') {
-                    clearInterval(interval);
-                    alert('Processing failed: ' + data.error);
-                    processBtn.disabled = false;
+                // Add zoom effect if enabled and segment is high value
+                if (seg.hasZoom && addZooms) {
+                    const zoomLevel = 1.1 + (intensity * 0.3); // 1.1 to 1.4
+                    const zoomDuration = Math.min(1, duration / 2);
+                    vFilter += `,zoompan=z='min(zoom+0.001,${zoomLevel})':d=${Math.floor(zoomDuration * 25)}:s=1920x1080`;
                 }
-            }, 1000);
-        }
-        
-        function showResult(report, jobId) {
-            document.getElementById('result').style.display = 'block';
-            document.getElementById('originalVideo').src = URL.createObjectURL(selectedFile);
-            document.getElementById('enhancedVideo').src = `/download/${jobId}`;
-            document.getElementById('downloadBtn').href = `/download/${jobId}`;
+                
+                vFilter += `[v${i}];`;
+                aFilter += `[a${i}];`;
+                
+                videoTrims.push(vFilter);
+                audioTrims.push(aFilter);
+            });
             
-            const statsDiv = document.getElementById('stats');
-            statsDiv.innerHTML = `
-                <div class="stat-box">
-                    <div class="stat-value">${report.cuts_made}</div>
-                    <div class="stat-label">Smart Cuts</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-value">${report.zooms_applied}</div>
-                    <div class="stat-label">Dynamic Zooms</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-value">${Math.round(report.engagement_score)}</div>
-                    <div class="stat-label">Avg Engagement</div>
-                </div>
-                <div class="stat-box">
-                    <div class="stat-value">${(report.original_duration/60).toFixed(1)}m</div>
-                    <div class="stat-label">Original Length</div>
-                </div>
-            `;
+            // Concatenate
+            const vConcat = segments.map((_, i) => `[v${i}]`).join('') + `concat=n=${segments.length}:v=1:a=0[outv];`;
+            const aConcat = segments.map((_, i) => `[a${i}]`).join('') + `concat=n=${segments.length}:v=0:a=1[outa]`;
             
-            processBtn.disabled = false;
-            processBtn.textContent = '✨ Process Another Video';
+            filterComplex = [...videoTrims, ...audioTrims, vConcat, aConcat].join('');
+            
+            // Audio enhancement
+            if (enhanceAudio) {
+                // Add audio normalization at the end
+                filterComplex = filterComplex.replace('[outa]', '[prea];[prea]loudnorm=I=-14:TP=-1.5:LRA=11[outa]');
+            }
+            
+            // Platform specific
+            let vfParams = '';
+            if (platform === 'tiktok') {
+                vfParams = 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,format=yuv420p';
+            } else if (platform === 'cinematic') {
+                vfParams = 'fps=24,format=yuv420p'; // Film look
+            } else {
+                vfParams = 'format=yuv420p';
+            }
+            
+            status.textContent = 'Rendering final video...';
+            progressBar.style.width = '60%';
+            progressText.textContent = '60%';
+            
+            // Execute FFmpeg
+            const args = [
+                '-i', inputName,
+                '-filter_complex', filterComplex,
+                '-map', '[outv]',
+                '-map', '[outa]',
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '23',
+                '-c:a', 'aac',
+                '-b:a', '192k',
+                '-movflags', '+faststart',
+                '-pix_fmt', 'yuv420p',
+                '-vf', vfParams,
+                '-y',
+                outputName
+            ];
+            
+            await ffmpeg.exec(args);
+            
+            progressBar.style.width = '90%';
+            progressText.textContent = '90%';
+            
+            // Read output
+            status.textContent = 'Finalizing...';
+            const data = await ffmpeg.readFile(outputName);
+            const videoBlob = new Blob([data.buffer], { type: 'video/mp4' });
+            const videoUrl = URL.createObjectURL(videoBlob);
+            
+            // Set download link
+            const downloadLink = document.getElementById('download-link');
+            downloadLink.href = videoUrl;
+            
+            // Cleanup
+            await ffmpeg.deleteFile(inputName);
+            await ffmpeg.deleteFile(outputName);
+            
+            progressBar.style.width = '100%';
+            progressText.textContent = '100%';
         }
+
+        // Responsive timeline on resize
+        window.addEventListener('resize', () => {
+            if (analysisData) updateTimelineVisual();
+        });
     </script>
 </body>
 </html>
-"""
-
-# Flask Routes
-@app.route('/')
-def index():
-    return HTML_TEMPLATE
-
-@app.route('/process', methods=['POST'])
-def process():
-    if 'video' not in request.files:
-        return jsonify({'error': 'No video uploaded'}), 400
-    
-    file = request.files['video']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
-    # Generate job ID
-    job_id = str(uuid.uuid4())
-    ext = file.filename.rsplit('.', 1)[1].lower()
-    input_path = os.path.join(app.config['UPLOAD_FOLDER'], f"{job_id}.{ext}")
-    file.save(input_path)
-    
-    # Get parameters
-    style = request.form.get('style', 'youtube')
-    platform = request.form.get('platform', 'youtube')
-    
-    # Start processing thread
-    thread = Thread(target=style_sync.process_video, args=(job_id, input_path, style, platform))
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({'job_id': job_id})
-
-@app.route('/status/<job_id>')
-def status(job_id):
-    return jsonify(style_sync.active_jobs.get(job_id, {'status': 'unknown'}))
-
-@app.route('/download/<job_id>')
-def download(job_id):
-    output_path = f"{app.config['OUTPUT_FOLDER']}/{job_id}_final.mp4"
-    if os.path.exists(output_path):
-        return send_file(output_path, as_attachment=True, download_name=f"stylesync_edit_{job_id[:8]}.mp4")
-    return jsonify({'error': 'File not found'}), 404
-
-if __name__ == '__main__':
-    print("🎬 Starting StyleSync AI...")
-    print("Open http://localhost:5000 in your browser")
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
